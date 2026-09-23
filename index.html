@@ -485,19 +485,42 @@
 
   // ---------- arXiv fetching ----------
   const API = "https://export.arxiv.org/api/query";
-  const PROXY = (u) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u);
+
+  // export.arxiv.org doesn't reliably send CORS headers for browser fetches,
+  // and any single public proxy can be flaky on its own — so try a direct
+  // request first, then work through a few proxies until one returns real
+  // Atom XML (not an error page, not an empty body).
+  const FETCH_STRATEGIES = [
+    (u) => u,
+    (u) => "https://corsproxy.io/?url=" + encodeURIComponent(u),
+    (u) => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(u),
+    (u) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u),
+  ];
+
+  function withTimeout(promise, ms) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), ms)),
+    ]);
+  }
 
   async function arxivRaw(url) {
-    try {
-      const r = await fetch(url);
-      if (!r.ok) throw new Error("bad status");
-      return await r.text();
-    } catch (e) {
-      // Likely a CORS or network hiccup on this host — fall back to a public proxy.
-      const r2 = await fetch(PROXY(url));
-      if (!r2.ok) throw new Error("proxy failed too");
-      return await r2.text();
+    let lastErr;
+    for (const strategy of FETCH_STRATEGIES) {
+      try {
+        const r = await withTimeout(fetch(strategy(url)), 9000);
+        if (!r.ok) throw new Error("bad status " + r.status);
+        const text = await r.text();
+        if (!text.includes("<feed") && !text.includes("<entry")) {
+          throw new Error("not a valid arXiv response");
+        }
+        return text;
+      } catch (e) {
+        lastErr = e;
+        // try the next strategy
+      }
     }
+    throw lastErr || new Error("all fetch strategies failed");
   }
 
   function buildUrl(searchQuery, maxResults) {
