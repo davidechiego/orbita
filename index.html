@@ -2,6 +2,15 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
+<script>
+  // Apply saved theme before first paint to avoid a flash of the wrong theme.
+  (function () {
+    try {
+      var t = localStorage.getItem("orbita_theme");
+      if (t === "light") document.documentElement.setAttribute("data-theme", "light");
+    } catch (e) {}
+  })();
+</script>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>Orbita — Follow arXiv</title>
 <meta name="description" content="Follow authors and topics on arXiv in a social-style feed." />
@@ -27,10 +36,29 @@
     --violet: #8b7ff0;
     --violet-dim: #5c539e;
     --danger: #d97757;
+    --overlay-92: rgba(18,18,28,0.92);
+    --overlay-94: rgba(18,18,28,0.94);
     --radius-s: 6px;
     --radius-m: 12px;
     --safe-top: env(safe-area-inset-top, 0px);
     --safe-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  :root[data-theme="light"] {
+    --bg: #f7f4ec;
+    --bg-elevated: #ffffff;
+    --bg-card: #ffffff;
+    --paper: #f4efe4;
+    --ink: #201f2b;
+    --ink-dim: #5c5973;
+    --ink-faint: #948fac;
+    --border: #e6e1d3;
+    --gold: #a9822e;
+    --gold-dim: #c9a655;
+    --violet: #6f63d6;
+    --violet-dim: #a79cf0;
+    --danger: #c1573a;
+    --overlay-92: rgba(247,244,236,0.92);
+    --overlay-94: rgba(247,244,236,0.94);
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
@@ -52,11 +80,20 @@
     position: sticky;
     top: var(--safe-top);
     z-index: 10;
-    background: rgba(18,18,28,0.92);
+    background: var(--overlay-92);
     backdrop-filter: blur(10px);
     border-bottom: 1px solid var(--border);
     padding: 18px 20px 14px;
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
   }
+  #themeToggleBtn {
+    flex: none;
+    margin-top: 2px;
+  }
+  #themeToggleBtn svg { width: 17px; height: 17px; }
   header.top h1 {
     margin: 0;
     font-size: 22px;
@@ -287,7 +324,7 @@
     position: fixed;
     left: 0; right: 0; bottom: 0;
     padding-bottom: var(--safe-bottom);
-    background: rgba(18,18,28,0.94);
+    background: var(--overlay-94);
     backdrop-filter: blur(10px);
     border-top: 1px solid var(--border);
     display: flex;
@@ -363,8 +400,13 @@
 <body>
 
 <header class="top">
-  <h1 class="serif">Orbita<span class="dot">.</span></h1>
-  <p id="headerSub">arXiv, followed your way</p>
+  <div>
+    <h1 class="serif">Orbita<span class="dot">.</span></h1>
+    <p id="headerSub">arXiv, followed your way</p>
+  </div>
+  <button class="iconbtn" id="themeToggleBtn" aria-label="Switch to light mode" title="Switch appearance">
+    <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.4M12 19.1v2.4M4.6 4.6l1.7 1.7M17.7 17.7l1.7 1.7M2.5 12h2.4M19.1 12h2.4M4.6 19.4l1.7-1.7M17.7 6.3l1.7-1.7"/></svg>
+  </button>
 </header>
 
 <main>
@@ -447,6 +489,7 @@
     topics: "orbita_topics",        // [{id,kind:'category'|'keyword', label, query}]
     seen: "orbita_seen",            // { [entryId]: true }
     cache: "orbita_cache",          // last built feed, for instant paint
+    theme: "orbita_theme",          // 'dark' | 'light'
   };
   const load = (k, fallback) => {
     try { const v = JSON.parse(localStorage.getItem(k)); return v == null ? fallback : v; }
@@ -486,15 +529,20 @@
   // ---------- arXiv fetching ----------
   const API = "https://export.arxiv.org/api/query";
 
-  // export.arxiv.org doesn't reliably send CORS headers for browser fetches,
-  // and any single public proxy can be flaky on its own — so try a direct
-  // request first, then work through a few proxies until one returns real
-  // Atom XML (not an error page, not an empty body).
+  // export.arxiv.org doesn't send CORS headers for browser fetches (it's meant
+  // for server-side use), so a direct request always fails in-browser. Public
+  // CORS proxies are individually flaky — any one of them can be down, rate
+  // limited, or blocked by an ad-blocker at a given moment — so instead of
+  // trying them one after another (slow, and one bad actor stalls everything)
+  // we race several proxies at once and use whichever comes back first with
+  // real Atom XML (not an error page, not an empty body).
   const FETCH_STRATEGIES = [
     (u) => u,
-    (u) => "https://corsproxy.io/?url=" + encodeURIComponent(u),
-    (u) => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(u),
     (u) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u),
+    (u) => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(u),
+    (u) => "https://corsproxy.io/?url=" + encodeURIComponent(u),
+    (u) => "https://thingproxy.freeboard.io/fetch/" + u,
+    (u) => "https://proxy.corsfix.com/?" + u,
   ];
 
   function withTimeout(promise, ms) {
@@ -504,23 +552,33 @@
     ]);
   }
 
-  async function arxivRaw(url) {
-    let lastErr;
-    for (const strategy of FETCH_STRATEGIES) {
+  async function fetchViaStrategy(strategy, url) {
+    const r = await fetch(strategy(url));
+    if (!r.ok) throw new Error("bad status " + r.status);
+    const text = await r.text();
+    if (!text.includes("<feed") && !text.includes("<entry")) {
+      throw new Error("not a valid arXiv response");
+    }
+    return text;
+  }
+
+  async function arxivRaw(url, { retries = 1 } = {}) {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      const attempts = FETCH_STRATEGIES.map((strategy) =>
+        withTimeout(fetchViaStrategy(strategy, url), 10000)
+      );
       try {
-        const r = await withTimeout(fetch(strategy(url)), 9000);
-        if (!r.ok) throw new Error("bad status " + r.status);
-        const text = await r.text();
-        if (!text.includes("<feed") && !text.includes("<entry")) {
-          throw new Error("not a valid arXiv response");
-        }
-        return text;
+        // Promise.any resolves as soon as ONE strategy succeeds, and only
+        // rejects if every single one fails.
+        return await Promise.any(attempts);
       } catch (e) {
-        lastErr = e;
-        // try the next strategy
+        if (attempt === retries) {
+          throw new Error("all fetch strategies failed");
+        }
+        // brief pause before a fresh round — helps with transient rate limits
+        await new Promise((res) => setTimeout(res, 800));
       }
     }
-    throw lastErr || new Error("all fetch strategies failed");
   }
 
   function buildUrl(searchQuery, maxResults) {
@@ -725,7 +783,7 @@
         };
       }
     } catch (e) {
-      resultsEl.innerHTML = `<div class="empty">Couldn't reach arXiv right now. Try again in a moment.</div>`;
+      resultsEl.innerHTML = `<div class="empty">Couldn't reach arXiv right now — all connection routes failed. This is usually temporary (arXiv or a relay is momentarily overloaded); tap Search to try again.</div>`;
     } finally {
       btn.disabled = false;
     }
@@ -868,6 +926,33 @@
     }
   }
 
+  // ---------- theme ----------
+  const SUN_ICON = '<circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.4M12 19.1v2.4M4.6 4.6l1.7 1.7M17.7 17.7l1.7 1.7M2.5 12h2.4M19.1 12h2.4M4.6 19.4l1.7-1.7M17.7 6.3l1.7-1.7"/>';
+  const MOON_ICON = '<path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a6.8 6.8 0 0 0 10.5 10.5Z"/>';
+
+  function applyTheme(theme) {
+    document.documentElement.setAttribute("data-theme", theme);
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute("content", theme === "light" ? "#f7f4ec" : "#12121c");
+    const icon = document.getElementById("themeIcon");
+    const btn = document.getElementById("themeToggleBtn");
+    if (icon) icon.innerHTML = theme === "light" ? MOON_ICON : SUN_ICON;
+    if (btn) btn.setAttribute("aria-label", theme === "light" ? "Switch to dark mode" : "Switch to light mode");
+  }
+
+  function initTheme() {
+    const saved = load(LS.theme, "dark");
+    applyTheme(saved === "light" ? "light" : "dark");
+    const btn = document.getElementById("themeToggleBtn");
+    if (btn) {
+      btn.addEventListener("click", () => {
+        const next = document.documentElement.getAttribute("data-theme") === "light" ? "dark" : "light";
+        save(LS.theme, next);
+        applyTheme(next);
+      });
+    }
+  }
+
   // ---------- nav ----------
   document.querySelectorAll("nav.bottom .tab").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -902,6 +987,7 @@
 
   // ---------- boot ----------
   function boot() {
+    initTheme();
     renderFeed();
     renderDiscoverTopics();
     renderFollowing();
